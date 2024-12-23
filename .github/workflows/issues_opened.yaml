@@ -1,0 +1,113 @@
+name: "OpenAI Issue Workflow"
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  run-openai:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Use Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "20.x"
+
+      - name: Cache APT packages
+        uses: actions/cache@v3
+        with:
+          path: /var/cache/apt
+          key: ${{ runner.os }}-apt-cache
+          restore-keys: |
+            ${{ runner.os }}-apt-cache
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install poppler-utils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Extract issue details
+        id: issue
+        run: |
+          ISSUE_BODY=$(echo "${{ github.event.issue.body }}" | base64 | tr -d '\n' | tr -d '\r')
+          echo "ISSUE_BODY=$ISSUE_BODY" >> $GITHUB_OUTPUT
+
+      - name: Build TypeScript
+        run: npm run build
+
+      - name: Extract model name from title
+        id: extract_model
+        run: |
+          MODEL=$(echo "${{ github.event.issue.title }}" | grep -o '#[a-zA-Z0-9._-]*' | head -n 1 | sed 's/#//')
+          if [ -z "$MODEL" ]; then
+            echo "No model specified in title. Defaulting to gpt-4."
+            MODEL="gpt-4"
+          fi
+          echo "MODEL=$MODEL" >> $GITHUB_OUTPUT
+
+      - name: Fetch PDF Attachment with Node.js
+        id: fetch_pdf
+        run: |
+          ATTACHMENT_URL=$(echo "${{ github.event.issue.body }}" | grep -Eo 'https://[^ ]+\.pdf' || true)
+          if [ -z "$ATTACHMENT_URL" ]; then
+            echo "No PDF URL found in the issue body."
+            echo "PDF_PATH=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Downloading attachment using Node.js... $ATTACHMENT_URL"
+          node dist/fetch_attachment.js "$ATTACHMENT_URL" issue.pdf
+          echo "PDF_PATH=issue.pdf" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Call OpenAI
+        id: openai_call
+        run: |
+          if [ -n "${{ steps.fetch_pdf.outputs.PDF_PATH }}" ]; then
+            echo "PDF file path: ${{ steps.fetch_pdf.outputs.PDF_PATH }}"
+            RESPONSE=$(node dist/call_openai.js \
+              "${{ env.OPENAI_API_KEY }}" \
+              "${{ steps.issue.outputs.ISSUE_BODY }}" \
+              "${{ steps.fetch_pdf.outputs.PDF_PATH }}" \
+              "${{ steps.extract_model.outputs.MODEL }}")
+          else
+            echo "No PDF file provided. Proceeding with prompt only."
+            RESPONSE=$(node dist/call_openai.js \
+              "${{ env.OPENAI_API_KEY }}" \
+              "${{ steps.issue.outputs.ISSUE_BODY }}" \
+              "" \
+              "${{ steps.extract_model.outputs.MODEL }}")
+          fi
+          DECODED_RESPONSE=$(echo "$RESPONSE" | base64 --decode)
+          echo "response<<EOF" >> $GITHUB_OUTPUT
+          echo "$DECODED_RESPONSE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Comment on the issue
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ${{ steps.openai_call.outputs.response }}
